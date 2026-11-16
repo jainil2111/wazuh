@@ -689,8 +689,8 @@ ENGINE_DEADLINE=0
 # containers of the same image resolve to the identical path and a start in one would kill the
 # other's engine.
 #
-# The PID is read before pstatus(), which deletes the file when its process is gone: a daemon that
-# already exited is then cleaned up silently, and only a launch that never wrote a PID file is
+# The PID file is looked for before pstatus(), which deletes it when its process is gone: a daemon
+# that already exited is then cleaned up silently, and only a launch that never wrote a PID file is
 # reported as one.
 #
 # With "wait-first" the daemon is given MAX_KILL_TRIES seconds to leave on its own before being
@@ -701,19 +701,22 @@ ENGINE_DEADLINE=0
 kill_wazuh_engine()
 {
     local pid
+    local no_pidfile
     local wait_first=${1:-""}
 
-    pid=`cat ${DIR}/var/run/wazuh-manager-analysisd-*.pid 2>/dev/null`
+    ls ${DIR}/var/run/wazuh-manager-analysisd-*.pid > /dev/null 2>&1
+    no_pidfile=$?
 
     pstatus wazuh-manager-analysisd "quiet"
     if [ $? = 1 ]; then
+        pid=${PIDS}
         if [ -z "$wait_first" ] || ! wait_pid $pid; then
             kill $pid 2>/dev/null
             if ! wait_pid $pid; then
                 kill -9 $pid 2>/dev/null
             fi
         fi
-    elif [ -z "$pid" ]; then
+    elif [ $no_pidfile != 0 ]; then
         echo "wazuh-manager-analysisd wrote no PID file; if it is still starting, stop it manually." >&2
     fi
 
@@ -770,16 +773,13 @@ get_wazuh_engine_pid()
 {
     local max_ticks=100
     local ticks=0
-    local pidfile
 
     while : ; do
-        for pidfile in ${DIR}/var/run/wazuh-manager-analysisd-*.pid; do
-            if [ -f "$pidfile" ]; then
-                pidfile="${pidfile##*-}"
-                echo "${pidfile%.pid}"
-                return 0
-            fi
-        done
+        pstatus wazuh-manager-analysisd quiet
+        if [ $? = 1 ]; then
+            echo "${PIDS%% *}"
+            return 0
+        fi
         ticks=$((ticks + 1))
         if [ $ticks -ge $max_ticks ] || [ $(date +%s) -ge ${ENGINE_DEADLINE} ]; then
             return 1  # timeout
@@ -992,31 +992,48 @@ start_service()
     rm -f ${DIR}/var/run/*.start
 }
 
+# pstatus <daemon> [quiet]: 1 when <daemon> runs, its pids left in PIDS; 0 otherwise. var/run is writable by
+# wazuh-manager, so a pid file there may be a link that account planted, or name a process it could not
+# signal itself. Every writer puts its pid in the file name too: the name is read, never the file, and a pid
+# counts only as a live process of <daemon> (its binary, or its python script, spelled with underscores) run
+# by the owner of the file. Any other pid file is removed; rm unlinks a link, never follows it.
 pstatus()
 {
     pfile=$1;
     _pstatus_quiet=${2:-""}
+    PIDS=""
     # pfile must be set
     if [ -z "${pfile}" ]; then
         return 0;
     fi
 
-    ls ${DIR}/var/run/${pfile}-*.pid > /dev/null 2>&1
-    if [ $? = 0 ]; then
-        for pid in `cat ${DIR}/var/run/${pfile}-*.pid 2>/dev/null`; do
-            if [ ! -d "/proc/${pid}" ]; then
-                if [ $USE_JSON = false ] && [ -z "${_pstatus_quiet}" ]; then
-                    echo "${pfile}: Process ${pid} not used by Wazuh, removing..."
+    for _pstatus_file in ${DIR}/var/run/${pfile}-*.pid; do
+        pid=${_pstatus_file##*-}
+        pid=${pid%.pid}
+        # Not a pid, or the pattern itself when nothing matches: nothing to report.
+        case "${pid}" in
+            ''|0*|*[!0-9]*)
+                rm -f "${_pstatus_file}"
+                continue
+                ;;
+        esac
+        case "$(tr '\000' ' ' 2>/dev/null < /proc/${pid}/cmdline)" in
+            *"${pfile}"*|*"$(echo ${pfile} | tr - _)"*)
+                if awk -v uid="$(stat -c %u "${_pstatus_file}" 2>/dev/null)" \
+                    '/^Uid:/ { ok = $2 == uid && $3 == uid } END { exit !ok }' /proc/${pid}/status 2>/dev/null; then
+                    PIDS="${PIDS:+${PIDS} }${pid}"
+                    continue
                 fi
-                rm -f ${DIR}/var/run/${pfile}-${pid}.pid
-                continue;
-            fi
+                ;;
+        esac
+        if [ $USE_JSON = false ] && [ -z "${_pstatus_quiet}" ]; then
+            echo "${pfile}: Process ${pid} not used by Wazuh, removing..."
+        fi
+        rm -f "${_pstatus_file}"
+    done
 
-            kill -0 ${pid} > /dev/null 2>&1
-            if [ $? = 0 ]; then
-                return 1;
-            fi
-        done
+    if [ -n "${PIDS}" ]; then
+        return 1;
     fi
 
     return 0;
@@ -1049,7 +1066,7 @@ stop_service()
             then
                 echo "Killing ${i}...";
             fi
-            pid=`cat ${DIR}/var/run/${i}-*.pid`
+            pid=${PIDS}
             kill $pid
         else
             if [ $USE_JSON != true ]
@@ -1074,7 +1091,7 @@ stop_service()
         pstatus ${i} "quiet";
 
         if [ $? = 1 ]; then
-            pid=`cat ${DIR}/var/run/${i}-*.pid`
+            pid=${PIDS}
 
             if wait_pid $pid
             then
