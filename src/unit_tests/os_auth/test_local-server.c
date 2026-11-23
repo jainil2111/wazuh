@@ -1700,12 +1700,12 @@ static void test_add_parses_deadline_ms(void **state) {
     expect_value(__wrap_w_request_agent_add_clustered, reenroll_kid, NULL);
     expect_value(__wrap_w_request_agent_add_clustered, reenroll_bearer, NULL);
     expect_value(__wrap_w_request_agent_add_clustered, source, NULL);
-    expect_value(__wrap_w_request_agent_add_clustered, deadline_ms, 1760000000000LL);
+    expect_value(__wrap_w_request_agent_add_clustered, deadline_ms, FUTURE_DEADLINE_MS);
     will_return(__wrap_w_request_agent_add_clustered, 0);
     will_return(__wrap_w_request_agent_add_clustered, "007");
     will_return(__wrap_w_request_agent_add_clustered, "675aaf366e6827ee7a77b2f7b4d89e603a21333c09afbb02c40191f199d7c915");
     will_return(__wrap_w_request_agent_add_clustered, "");
-    cJSON *response = dispatch("{\"function\":\"add\",\"arguments\":{\"name\":\"wk-agent\",\"ip\":\"any\",\"deadline_ms\":1760000000000}}");
+    cJSON *response = dispatch("{\"function\":\"add\",\"arguments\":{\"name\":\"wk-agent\",\"ip\":\"any\",\"deadline_ms\":4000000000000}}");
     assert_int_equal(response_error(response), 0);
     cJSON_Delete(response);
     config.worker_node = FALSE;
@@ -3021,10 +3021,14 @@ static void test_reenroll_malformed_or_with_token_id_9027(void **state) {
 }
 
 /* A worker refuses a re-enrollment whose deadline has gone by without spending a cluster round
- * trip on it: the wrap is NOT expected, so cmocka aborts if the request is forwarded anyway. */
+ * trip on it: the wrap is NOT expected, so cmocka aborts if the request is forwarded anyway. The
+ * worker is the node that decided, so it is the one that reports it. */
 static void test_worker_refuses_a_late_reenrollment_without_forwarding(void **state) {
     (void)state;
     EXPECT_LOG_DEBUG2();
+    expect_string(__wrap__minfo, formatted_msg,
+                  "Re-enrollment of agent '001' discarded: the deadline the request carried had "
+                  "already passed, so nothing was rotated.");
     config.worker_node = TRUE;
 
     cJSON *response = reenroll_with_deadline("001", "wk-late", PAST_DEADLINE_MS);
@@ -3034,23 +3038,47 @@ static void test_worker_refuses_a_late_reenrollment_without_forwarding(void **st
     config.worker_node = FALSE;
 }
 
-/* A FIRST enrollment that arrives late is still forwarded: its caller retries, and the retry has to
- * be able to register the agent. On a worker every enrollment comes through local_add_clustered, so
- * without the reenroll_kid condition this request would be dropped too. */
-static void test_worker_forwards_a_late_first_enrollment(void **state) {
+/* A FIRST enrollment that arrives late is refused on the worker too, and never reaches the master
+ * with the tolerance added: the master would refuse it anyway, and applying it late would register
+ * an agent its caller never learns about. The wrap is NOT expected, so cmocka aborts if it is
+ * forwarded. */
+static void test_worker_refuses_a_late_first_enrollment_without_forwarding(void **state) {
+    (void)state;
+    EXPECT_LOG_DEBUG2();
+    expect_string(__wrap__minfo, formatted_msg,
+                  "Enrollment of 'wk-first-late' discarded: the deadline the request carried had "
+                  "already passed, so no agent was registered.");
+    config.worker_node = TRUE;
+    config.enroll_deadline_tolerance = 5;
+
+    char request[256];
+    snprintf(request, sizeof(request),
+             "{\"function\":\"add\",\"arguments\":{\"name\":\"wk-first-late\",\"ip\":\"any\","
+             "\"deadline_ms\":%lld}}", (long long)PAST_DEADLINE_MS);
+    cJSON *response = dispatch(request);
+    assert_int_equal(response_error(response), 9032);
+    cJSON_Delete(response);
+
+    config.enroll_deadline_tolerance = 0;
+    config.worker_node = FALSE;
+}
+
+/* A request still in time is forwarded with the tolerance added, so the master judges it against a
+ * bound that absorbs the difference between the two nodes' clocks. */
+static void test_worker_adds_the_tolerance_to_a_deadline_still_ahead(void **state) {
     (void)state;
     EXPECT_LOG_DEBUG2();
     expect_string(__wrap__mdebug1, formatted_msg, "Dispatching enrollment request to master node");
     config.worker_node = TRUE;
     config.enroll_deadline_tolerance = 5;
 
-    expect_string(__wrap_w_request_agent_add_clustered, name, "wk-first-late");
+    expect_string(__wrap_w_request_agent_add_clustered, name, "wk-in-time");
     expect_string(__wrap_w_request_agent_add_clustered, ip, "any");
     expect_value(__wrap_w_request_agent_add_clustered, token_id, NULL);
     expect_value(__wrap_w_request_agent_add_clustered, reenroll_kid, NULL);
     expect_value(__wrap_w_request_agent_add_clustered, reenroll_bearer, NULL);
     expect_value(__wrap_w_request_agent_add_clustered, source, NULL);
-    expect_value(__wrap_w_request_agent_add_clustered, deadline_ms, PAST_DEADLINE_MS + 5000);
+    expect_value(__wrap_w_request_agent_add_clustered, deadline_ms, FUTURE_DEADLINE_MS + 5000);
     will_return(__wrap_w_request_agent_add_clustered, 0);
     will_return(__wrap_w_request_agent_add_clustered, "009");
     will_return(__wrap_w_request_agent_add_clustered, "675aaf366e6827ee7a77b2f7b4d89e603a21333c09afbb02c40191f199d7c915");
@@ -3058,8 +3086,8 @@ static void test_worker_forwards_a_late_first_enrollment(void **state) {
 
     char request[256];
     snprintf(request, sizeof(request),
-             "{\"function\":\"add\",\"arguments\":{\"name\":\"wk-first-late\",\"ip\":\"any\","
-             "\"deadline_ms\":%lld}}", (long long)PAST_DEADLINE_MS);
+             "{\"function\":\"add\",\"arguments\":{\"name\":\"wk-in-time\",\"ip\":\"any\","
+             "\"deadline_ms\":%lld}}", (long long)FUTURE_DEADLINE_MS);
     cJSON *response = dispatch(request);
     assert_int_equal(response_error(response), 0);
     cJSON_Delete(response);
@@ -3070,7 +3098,7 @@ static void test_worker_forwards_a_late_first_enrollment(void **state) {
 
 /* The tolerance absorbs the difference between the two nodes' clocks, and is added only when there
  * is a deadline to add it to: a request without one must still arrive with 0, or the master would
- * read five seconds past 1970 and refuse it. This is the case that guards that. */
+ * read an instant just past 1970 and refuse it. This is the case that guards that. */
 static void test_worker_adds_the_tolerance_only_when_there_is_a_deadline(void **state) {
     (void)state;
     EXPECT_LOG_DEBUG2();
@@ -3230,7 +3258,8 @@ int main(void) {
         cmocka_unit_test(test_reenroll_duplicate_name_of_another_agent_9008),
         cmocka_unit_test(test_reenroll_malformed_or_with_token_id_9027),
         cmocka_unit_test(test_worker_refuses_a_late_reenrollment_without_forwarding),
-        cmocka_unit_test(test_worker_forwards_a_late_first_enrollment),
+        cmocka_unit_test(test_worker_refuses_a_late_first_enrollment_without_forwarding),
+        cmocka_unit_test(test_worker_adds_the_tolerance_to_a_deadline_still_ahead),
         cmocka_unit_test(test_worker_adds_the_tolerance_only_when_there_is_a_deadline),
         cmocka_unit_test(test_reenroll_on_worker_forwards_kid_and_bearer),
         cmocka_unit_test(test_local_dispatch_unknown_function_is_9003),
