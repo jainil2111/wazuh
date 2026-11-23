@@ -235,6 +235,13 @@ is enforced matters more than the value:
   reach `local_log_refusal()`, which only covers the refusals the dispatcher itself decides; a worker
   that forwarded a request the master then discarded also relays the master's `9032` in its usual
   `Error <code>: <message>.` shape.
+- **The check depends on two clocks in a cluster.** A forwarded deadline was stamped on the
+  worker's clock and is compared on the master's (`w_get_epoch_ms()`), and nothing detects or
+  corrects a difference: a master behind the worker applies requests for that much longer after the
+  worker answered `503`; a master ahead by more than the remaining budget plus the tolerance discards
+  every enrollment that worker forwards, first ones included. Cluster nodes need NTP; the operator's
+  view of both cases is in `docs/ref/modules/authd/enrollment-lifecycle.md` (Clocks between cluster
+  nodes).
 - **No deadline means today's behaviour.** Absent, non-numeric, negative or out of range is read as
   `0` and the request is applied as before; the server API's `add` sends none. The tolerance is added
   only to a deadline that exists, never to `0`.
