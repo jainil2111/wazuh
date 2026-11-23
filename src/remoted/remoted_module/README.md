@@ -1713,11 +1713,14 @@ and — for every `add` — `reenroll_secret` (64 hex chars, generated next to t
 **`deadline_ms` is the instant this module stops being able to deliver authd's answer**, absolute,
 in milliseconds since the Unix epoch, so that authd can discard work nobody can receive instead of
 applying it blind — the failure that leaves a re-enrolling agent locked out of its own id. It is
-computed in `deadlineFor()` **at dequeue**, not when the request arrived, because that is when the
-two budgets that actually cut the wait start:
-`min(now + connectTimeoutMs + responseTimeoutMs, arrivalMs + httpRequestTimeoutMs)`. The queue
-therefore carries the structured `AuthdAddRequest` (with its `arrivalMs`) rather than a serialized
-payload: the bytes are built in the worker, after the wait. The field is omitted when the deadline
+computed in `deadlineFor()` **once the worker is connected to authd**, not when the request arrived
+nor when it was dequeued, because from then on the only wait left is the reply:
+`min(connected + responseTimeoutMs, arrivalMs + httpRequestTimeoutMs)`. The connect budget is not in
+it — it is spent or was never needed by then, and adding it would let authd apply a request for up to
+`connectTimeoutMs` after this module gave up. `performRequest()` sets `SO_RCVTIMEO` to exactly
+`deadline_ms - connected` (at least 1 ms), so the instant authd is told is the instant the wait ends.
+The queue therefore carries the structured `AuthdAddRequest` (with its `arrivalMs`) rather than a
+serialized payload: the bytes are built in the worker, after the connect. The field is omitted when the deadline
 is `0`, and authd treats an absent, malformed or out-of-range value as "no deadline" — the fail-safe
 direction is the behaviour that existed before it. A worker's authd adds
 `remoted.enroll_deadline_tolerance` to it before forwarding to the master, and the master's refusal

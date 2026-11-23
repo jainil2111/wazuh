@@ -95,9 +95,10 @@ namespace remoted::enrollment
             return message;
         }
 
-        /// The `add` wire request. Built on the WORKER thread that dequeues the request (see
-        /// enqueue() and deadlineFor()), not on the caller's: the deadline below is measured from
-        /// the dequeue, so the bounded queue carries the structured request rather than bytes.
+        /// The `add` wire request. Built on the WORKER thread, once the connection to authd is up
+        /// (see performRequest() and deadlineFor()), not on the caller's: the deadline below is
+        /// measured from that instant, so the bounded queue carries the structured request rather
+        /// than bytes.
         /// @param deadlineMs Absolute instant (ms since the Unix epoch) after which the answer can
         ///                    no longer be delivered; 0 means "no deadline" and the field is omitted.
         std::string buildAddPayload(const AuthdAddRequest& request, std::int64_t deadlineMs)
@@ -203,10 +204,10 @@ namespace remoted::enrollment
             }
         }
 
-        /// The request travels UNSERIALIZED from here on: the payload is built by the worker that
-        /// dequeues it, not by the caller's thread, because the deadline it carries has to be
-        /// measured from the dequeue -- authd's connect/response budgets only start counting then
-        /// Queue wait therefore does not eat into the deadline.
+        /// The request travels UNSERIALIZED from here on: the payload is built by the worker once
+        /// it is connected to authd, not by the caller's thread, because the deadline it carries is
+        /// the instant the reply wait that starts there gives up. Queue wait and connect time
+        /// therefore do not eat into the deadline.
         void enqueue(AuthdAddRequest request, std::function<void(AuthdResult)> callback)
         {
             std::function<void(AuthdResult)> reject;
@@ -309,27 +310,9 @@ namespace remoted::enrollment
                 // already-torn-down connection) -- would escape this thread's entry function and
                 // std::terminate the entire remoted daemon, taking down every other agent's
                 // connection along with the one enrollment request that triggered it.
-                // Serialized OUTSIDE the try below, and its failure answered explicitly: an
-                // exception escaping into that catch would only be logged, leaving this request's
-                // responder unanswered and the agent waiting out its whole HTTP budget.
-                std::string wire;
                 try
                 {
-                    wire = buildAddPayload(req.request, deadlineFor(req.request));
-                }
-                catch (const std::exception& e)
-                {
-                    LOGFN_ERROR(logFn(), "AuthdClient could not serialize an enrollment request: %s", e.what());
-                    AuthdResult failed;
-                    failed.errorCode = kAuthdRequestNotSentErrorCode;
-                    failed.message = "Enrollment request could not be serialized";
-                    req.callback(std::move(failed));
-                    continue;
-                }
-
-                try
-                {
-                    req.callback(performRequest(wire));
+                    req.callback(performRequest(req.request));
                 }
                 catch (const std::exception& e)
                 {
@@ -342,36 +325,41 @@ namespace remoted::enrollment
             }
         }
 
-        /// The instant after which THIS client can no longer deliver an answer, as an absolute
-        /// wall-clock epoch in milliseconds -- what authd on the master compares against its own
-        /// clock to refuse a re-enrollment nobody is waiting for any more.
+        /// The instant after which THIS client stops waiting for authd's answer, as an absolute
+        /// wall-clock epoch in milliseconds -- what authd compares against its own clock to refuse
+        /// an enrollment nobody is waiting for any more.
         ///
-        /// Computed here, on the worker, and deliberately NOT when the request was enqueued: the
-        /// connect and response budgets below only start counting once a worker picks the request
-        /// up (::poll() for the connect, SO_RCVTIMEO for the reply), so a deadline stamped at
-        /// enqueue time would be earlier than the instant this client actually gives up, and the
-        /// master would discard requests still being waited for.
+        /// Called once the connection to authd is up, with that instant as `connectedMs`, and not
+        /// when the request was dequeued: the connect budget is either already spent or not spent
+        /// at all by then, and only the reply wait is left. Adding the connect budget would let
+        /// authd apply a request for up to that long after this client gave up -- the failure the
+        /// deadline exists to prevent. performRequest() sets the receive timeout to exactly the
+        /// time between `connectedMs` and the value returned here, so the two cannot disagree.
         ///
         /// Capped by the request's own HTTP budget: remoted only WARNS at start-up when authd's
         /// budget exceeds http_request_timeout, so that cap is the only hard bound there is.
         /// Returns 0 ("no deadline", the behaviour that predates this) when the arrival instant is
         /// unknown, which keeps every path that does not set it working exactly as before.
-        std::int64_t deadlineFor(const AuthdAddRequest& request) const
+        std::int64_t deadlineFor(const AuthdAddRequest& request, std::int64_t connectedMs) const
         {
             if (!request.arrivalMs)
             {
                 return 0;
             }
 
-            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::system_clock::now().time_since_epoch())
-                                   .count();
-            const std::int64_t authdBudget = nowMs + m_connectTimeoutMs + m_responseTimeoutMs;
+            const std::int64_t replyBudget = connectedMs + m_responseTimeoutMs;
             const std::int64_t httpBudget = *request.arrivalMs + m_httpRequestTimeoutMs;
-            return std::min(authdBudget, httpBudget);
+            return std::min(replyBudget, httpBudget);
         }
 
-        AuthdResult performRequest(const std::string& requestStr)
+        static std::int64_t epochMs()
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        }
+
+        AuthdResult performRequest(const AuthdAddRequest& request)
         {
             using SocketType = Socket<OSPrimitives, SizeHeaderProtocol>;
 
@@ -472,11 +460,39 @@ namespace remoted::enrollment
                 return result;
             }
 
+            // The deadline is stamped here, with the connection up, from the budget that is
+            // actually left; the reply wait below is bounded by that same budget, so the instant
+            // authd is told is the instant this client stops waiting.
+            const std::int64_t connectedMs = epochMs();
+            std::int64_t deadlineMs = 0;
+            std::string requestStr;
+            try
+            {
+                deadlineMs = deadlineFor(request, connectedMs);
+                requestStr = buildAddPayload(request, deadlineMs);
+            }
+            catch (const std::exception& e)
+            {
+                // Answered explicitly rather than thrown: the worker loop's catch would only log
+                // it, leaving this request's responder unanswered and the agent waiting out its
+                // whole HTTP budget. Nothing was sent, so authd cannot have acted on it.
+                LOGFN_ERROR(logFn(), "AuthdClient could not serialize an enrollment request: %s", e.what());
+                result.message = "Enrollment request could not be serialized";
+                return result;
+            }
+
+            // Without a deadline the wait is the full response budget, as before deadlines existed.
+            // With one, it is what is left of it, never less than 1 ms: a zero timeval would mean
+            // "wait forever", and a request already past its HTTP budget is still sent so authd
+            // refuses it with 9032 instead of this client guessing the outcome.
+            const std::int64_t waitMs =
+                deadlineMs > 0 ? std::max<std::int64_t>(1, deadlineMs - connectedMs) : m_responseTimeoutMs;
+
             // Bounds both the send and the reply wait. Socket/OSPrimitives don't expose
             // setsockopt() publicly (it's used internally for the send/receive buffer sizes only),
             // so this is set directly on the raw fd via the standard POSIX call.
-            const struct timeval timeout {static_cast<time_t>(m_responseTimeoutMs / 1000),
-                                          static_cast<suseconds_t>((m_responseTimeoutMs % 1000) * 1000)};
+            const struct timeval timeout {static_cast<time_t>(waitMs / 1000),
+                                          static_cast<suseconds_t>((waitMs % 1000) * 1000)};
             ::setsockopt(socket.fileDescriptor(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
             ::setsockopt(socket.fileDescriptor(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
