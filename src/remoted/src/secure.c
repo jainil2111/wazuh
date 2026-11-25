@@ -1945,13 +1945,25 @@ int _close_sock(keystore * keys, int sock) {
     // One read can queue hundreds of frames of a connection, and the first one that is refused closes
     // it: by the time the others are refused the descriptor is closed, and its number may belong to an
     // agent that connected since. Nothing of theirs is closed for it, and its counter is left alone.
-    if (rem_handled_frame_outlived_its_connection(sock)) {
-        mdebug2("TCP peer [%d] was already disconnected.", sock);
+    // The check of rem_handled_frame_outlived_its_connection(), with the fence read once.
+    const size_t fence = handled_message && handled_message->sock == sock ? rem_getCounter(sock) : 0;
+
+    if (handled_message && handled_message->sock == sock && handled_message->counter <= fence) {
+        // Once per closed connection and worker thread, not once per frame it left queued: each frame has
+        // a counter of its own, the fence the close left on the descriptor is what they share.
+        static __thread int logged_sock = -1;
+        static __thread size_t logged_fence = 0;
+
+        if (logged_sock != sock || logged_fence != fence) {
+            logged_sock = sock;
+            logged_fence = fence;
+            mdebug2("TCP peer [%d] was already disconnected.", sock);
+        }
         return retval;
     }
 
-    rem_setCounter(sock, global_counter);
-
+    // The fence is not raised here: nb_close_socket() checks it once more under its mutex, against the
+    // frame being handled, and raises it itself when it closes.
     key_lock_read();
     retval = OS_DeleteSocket(keys, sock);
     key_unlock();

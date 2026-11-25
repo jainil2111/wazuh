@@ -29,7 +29,17 @@ constexpr std::chrono::seconds TERM_FAILURE_LOG_WINDOW {30};
  */
 inline std::string termFailureText(std::string_view what)
 {
-    std::string text {what.substr(0, TERM_FAILURE_WHAT_MAX)};
+    if (what.size() > TERM_FAILURE_WHAT_MAX)
+    {
+        // Cut between characters: back up over the continuation bytes of a UTF-8 sequence the limit splits.
+        auto cut = TERM_FAILURE_WHAT_MAX;
+        while (cut > 0 && (static_cast<unsigned char>(what[cut]) & 0xC0) == 0x80)
+        {
+            --cut;
+        }
+        what = what.substr(0, cut);
+    }
+    std::string text {what};
     for (auto& c : text)
     {
         const auto byte = static_cast<unsigned char>(c);
