@@ -50,9 +50,9 @@ build_package(){
 
     if [[ "${ARCHITECTURE_TARGET}" == "amd64" ]] ||  [[ "${ARCHITECTURE_TARGET}" == "ppc64le" ]] || \
         [[ "${ARCHITECTURE_TARGET}" == "arm64" ]]; then
-        debuild --rootcmd=sudo -b -uc -us -nc
+        debuild --rootcmd=sudo --no-lintian -b -uc -us -nc
     elif [[ "${ARCHITECTURE_TARGET}" == "armhf" ]]; then
-        linux32 debuild --rootcmd=sudo -b -uc -us -nc
+        linux32 debuild --rootcmd=sudo --no-lintian -b -uc -us -nc
     else
         linux32 debuild --rootcmd=sudo -ai386 -b -uc -us -nc
     fi
